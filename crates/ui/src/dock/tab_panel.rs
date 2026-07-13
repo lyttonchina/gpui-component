@@ -235,9 +235,6 @@ impl TabPanel {
             return false;
         };
         if ix == self.active_ix {
-            if let Some(active_panel) = self.panels.get(ix) {
-                active_panel.set_active(true, window, cx);
-            }
             self.focus_active_panel(window, cx);
             cx.notify();
         } else {
