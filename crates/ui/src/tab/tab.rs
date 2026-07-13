@@ -474,6 +474,10 @@ impl Tab {
         Self::default()
     }
 
+    fn hover_group_name(ix: usize) -> SharedString {
+        format!("tab-{ix}").into()
+    }
+
     /// Set label for the tab.
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
@@ -535,6 +539,30 @@ impl Tab {
     /// Set the right side of the tab
     pub fn suffix(mut self, suffix: impl IntoElement) -> Self {
         self.suffix = Some(suffix.into_any_element());
+        self
+    }
+
+    /// Set the right side of the tab using an [`AnyElement`] produced by a panel.
+    ///
+    /// `hover_only` controls whether the suffix is only revealed when the
+    /// tab itself is hovered. When `true`, the suffix starts invisible and is
+    /// shown by the tab-level group-hover handler so it stays hidden until the
+    /// user moves the mouse over the tab.
+    pub fn suffix_for_panel(mut self, suffix: Option<impl IntoElement>, hover_only: bool) -> Self {
+        let Some(suffix) = suffix else {
+            return self;
+        };
+        let suffix = suffix.into_any_element();
+        let wrapper = if hover_only {
+            div()
+                .invisible()
+                .group_hover(Self::hover_group_name(self.ix), |style| style.visible())
+                .child(suffix)
+                .into_any_element()
+        } else {
+            suffix
+        };
+        self.suffix = Some(wrapper);
         self
     }
 
@@ -727,6 +755,7 @@ impl RenderOnce for Tab {
 
         self.base
             .id(self.ix)
+            .group(Self::hover_group_name(self.ix))
             .role(Role::Tab)
             .when_some(aria_label, |this, label| this.aria_label(label))
             .aria_selected(self.selected)
@@ -815,5 +844,12 @@ mod tests {
         let tab = Tab::new().label("Acct").aria_label("Account settings");
 
         assert_eq!(tab.a11y_label(), Some("Account settings".into()));
+    }
+
+    #[gpui::test]
+    fn panel_suffix_hover_group_is_scoped_to_each_tab(_cx: &mut gpui::TestAppContext) {
+        assert_eq!(Tab::hover_group_name(0), "tab-0");
+        assert_eq!(Tab::hover_group_name(7), "tab-7");
+        assert_ne!(Tab::hover_group_name(0), Tab::hover_group_name(1));
     }
 }

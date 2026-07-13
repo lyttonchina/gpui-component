@@ -451,6 +451,30 @@ impl DockItem {
         }
     }
 
+    fn add_panel_to_tab_panel(
+        &mut self,
+        target: &Entity<TabPanel>,
+        panel: Arc<dyn PanelView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        match self {
+            Self::Tabs { view, items, .. } if view == target => {
+                if !items.iter().any(|item| item.view() == panel.view()) {
+                    items.push(panel.clone());
+                }
+                view.update(cx, |tab_panel, cx| {
+                    tab_panel.add_panel(panel, window, cx);
+                });
+                true
+            }
+            Self::Split { items, .. } => items
+                .iter_mut()
+                .any(|item| item.add_panel_to_tab_panel(target, panel.clone(), window, cx)),
+            Self::Tabs { .. } | Self::Tiles { .. } | Self::Panel { .. } => false,
+        }
+    }
+
     /// Remove a panel from the dock item.
     pub fn remove_panel(&self, panel: Arc<dyn PanelView>, window: &mut Window, cx: &mut App) {
         match self {
@@ -870,6 +894,26 @@ impl DockArea {
                     .add_panel(panel, &cx.entity().downgrade(), bounds, window, cx);
             }
         }
+    }
+
+    /// Add a panel to a specific tab group in the center dock.
+    ///
+    /// Returns `false` when the target group is not part of the current center
+    /// dock tree.
+    pub fn add_panel_to_tab_panel(
+        &mut self,
+        target: &Entity<TabPanel>,
+        panel: Arc<dyn PanelView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let added = self
+            .center
+            .add_panel_to_tab_panel(target, panel, window, cx);
+        if added {
+            cx.notify();
+        }
+        added
     }
 
     /// Remove panel from the DockArea at the given placement.

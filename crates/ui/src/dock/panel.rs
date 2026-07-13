@@ -77,13 +77,53 @@ pub trait Panel: EventEmitter<PanelEvent> + Render + Focusable {
 
     /// The suffix of the panel title, default is `None`.
     ///
-    /// This is used to add a suffix element to the panel title.
+    /// This is used to add a suffix element to the panel title. It is only
+    /// rendered when the panel is the active panel of the [`TabPanel`] (the
+    /// collapsed title bar shows it once).
     fn title_suffix(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         None::<gpui::Div>
+    }
+
+    /// Rich title element rendered inside this panel's tab.
+    ///
+    /// When absent, [`TabPanel`] falls back to [`Panel::tab_name`] and then
+    /// [`Panel::title`]. This keeps per-tab styling separate from collapsed
+    /// panel headers.
+    fn tab_title(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        None::<gpui::Div>
+    }
+
+    /// The suffix of each tab, default is `None`.
+    ///
+    /// Unlike [`Panel::title_suffix`], which is only rendered for the active
+    /// panel, `tab_suffix` is rendered next to every tab in the [`TabPanel`].
+    /// It is the place for per-tab actions such as a hover close button.
+    ///
+    /// The default is `None`, so existing panels keep their current visual
+    /// behaviour and don't gain an automatic close button.
+    fn tab_suffix(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        None::<gpui::Div>
+    }
+
+    /// Whether each tab's suffix should be revealed only on hover, default is `true`.
+    ///
+    /// When `true`, the [`TabPanel`] will wrap the `tab_suffix` in a hover-revealed
+    /// container so it stays hidden until the user hovers the tab. Set this to
+    /// `false` if a tab wants to surface its suffix at all times.
+    fn tab_suffix_hover_only(&self, _cx: &App) -> bool {
+        true
     }
 
     /// Whether the panel can be closed, default is `true`.
@@ -171,6 +211,15 @@ pub trait PanelView: 'static + Send + Sync {
     fn tab_name(&self, cx: &App) -> Option<SharedString>;
     fn title(&self, window: &mut Window, cx: &mut App) -> AnyElement;
     fn title_suffix(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement>;
+    fn tab_title(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        None
+    }
+    fn tab_suffix(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        None
+    }
+    fn tab_suffix_hover_only(&self, cx: &App) -> bool {
+        true
+    }
     fn title_style(&self, cx: &App) -> Option<TitleStyle>;
     fn closable(&self, cx: &App) -> bool;
     fn zoomable(&self, cx: &App) -> Option<PanelControl>;
@@ -209,6 +258,22 @@ impl<T: Panel> PanelView for Entity<T> {
             this.title_suffix(window, cx)
                 .map(|el| el.into_any_element())
         })
+    }
+
+    fn tab_title(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        self.update(cx, |this, cx| {
+            this.tab_title(window, cx).map(|el| el.into_any_element())
+        })
+    }
+
+    fn tab_suffix(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        self.update(cx, |this, cx| {
+            this.tab_suffix(window, cx).map(|el| el.into_any_element())
+        })
+    }
+
+    fn tab_suffix_hover_only(&self, cx: &App) -> bool {
+        self.read(cx).tab_suffix_hover_only(cx)
     }
 
     fn title_style(&self, cx: &App) -> Option<TitleStyle> {
