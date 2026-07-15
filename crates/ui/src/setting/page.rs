@@ -28,6 +28,7 @@ pub struct SettingPage {
     pub(super) description: Option<SharedString>,
     pub(super) groups: Vec<SettingGroup>,
     pub(super) header_style: StyleRefinement,
+    pub(super) id: Option<SharedString>,
 }
 
 impl SettingPage {
@@ -41,7 +42,31 @@ impl SettingPage {
             description: None,
             groups: Vec::new(),
             header_style: StyleRefinement::default(),
+            id: None,
         }
+    }
+
+    /// Read the page title.
+    pub fn title_value(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    /// Snapshot the configured groups, returning clones of each one.
+    pub fn groups_iter(&self) -> Vec<SettingGroup> {
+        self.groups.clone()
+    }
+
+    /// Read the assigned identifier, if any.
+    pub fn page_id(&self) -> Option<SharedString> {
+        self.id.clone()
+    }
+
+    /// Assign a stable identifier for deep links. The host application keeps
+    /// a `HashMap<id, (page_ix, group_ix)>` so a deep link can resolve to a
+    /// selection without rebuilding the page list.
+    pub fn id(mut self, id: impl Into<SharedString>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Set the title of the setting page.

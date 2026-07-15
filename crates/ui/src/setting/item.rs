@@ -28,6 +28,7 @@ pub enum SettingItem {
         layout: Axis,
         disabled: bool,
         field: Rc<dyn AnySettingField>,
+        id: Option<SharedString>,
     },
     /// A full custom element to render.
     Element {
@@ -38,6 +39,7 @@ pub enum SettingItem {
         /// performs the reset.
         reset_handler: Option<ResetHandler>,
         render: Rc<dyn Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement + 'static>,
+        id: Option<SharedString>,
     },
 }
 
@@ -54,6 +56,7 @@ impl SettingItem {
             disabled: false,
             keywords: Vec::new(),
             field: Rc::new(field),
+            id: None,
         }
     }
 
@@ -70,6 +73,25 @@ impl SettingItem {
             render: Rc::new(move |options, window, cx| {
                 render(options, window, cx).into_any_element()
             }),
+            id: None,
+        }
+    }
+
+    /// Assign a stable identifier for deep links and registry lookups.
+    pub fn id(mut self, id: impl Into<SharedString>) -> Self {
+        let id = id.into();
+        match &mut self {
+            SettingItem::Item { id: slot, .. } => *slot = Some(id),
+            SettingItem::Element { id: slot, .. } => *slot = Some(id),
+        }
+        self
+    }
+
+    /// Read the assigned identifier, if any.
+    pub fn item_id(&self) -> Option<SharedString> {
+        match self {
+            SettingItem::Item { id, .. } => id.clone(),
+            SettingItem::Element { id, .. } => id.clone(),
         }
     }
 
@@ -170,17 +192,21 @@ impl SettingItem {
                 keywords,
                 ..
             } => {
-                let q = &query.to_lowercase();
-                title.to_lowercase().contains(q)
-                    || description
-                        .as_ref()
-                        .map_or(false, |d| d.get_text(cx).to_lowercase().contains(q))
-                    || keywords.iter().any(|s| s.to_lowercase().contains(q))
+                let description = description
+                    .as_ref()
+                    .map(|value| value.get_text(cx))
+                    .unwrap_or_default();
+                matches_query_terms(
+                    query,
+                    std::iter::once(title.as_ref())
+                        .chain(std::iter::once(description.as_str()))
+                        .chain(keywords.iter().map(|value| value.as_ref())),
+                )
             }
             // We need to show all custom elements when not searching.
             SettingItem::Element { keywords, .. } => {
-                let q = &query.to_lowercase();
-                query.is_empty() || keywords.iter().any(|s| s.to_lowercase().contains(q))
+                query.is_empty()
+                    || matches_query_terms(query, keywords.iter().map(|value| value.as_ref()))
             }
         }
     }
@@ -330,5 +356,33 @@ impl SettingItem {
                     ))
                     .into_any_element(),
             })
+    }
+}
+
+fn matches_query_terms<'a>(query: &str, fields: impl IntoIterator<Item = &'a str>) -> bool {
+    let fields = fields
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .all(|term| fields.iter().any(|field| field.contains(&term)))
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::matches_query_terms;
+
+    #[test]
+    fn search_matches_each_term_across_title_and_filter_keywords() {
+        assert!(matches_query_terms(
+            "font @modified",
+            ["Editor Font Size", "@modified", "@source:user"],
+        ));
+        assert!(!matches_query_terms(
+            "font @source:project",
+            ["Editor Font Size", "@modified", "@source:user"],
+        ));
     }
 }

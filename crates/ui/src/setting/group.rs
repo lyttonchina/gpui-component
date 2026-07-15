@@ -19,6 +19,7 @@ pub struct SettingGroup {
     pub(super) title: Option<SharedString>,
     pub(super) description: Option<SharedString>,
     pub(super) items: Vec<SettingItem>,
+    pub(super) id: Option<SharedString>,
 }
 
 impl Styled for SettingGroup {
@@ -35,7 +36,24 @@ impl SettingGroup {
             title: None,
             description: None,
             items: Vec::new(),
+            id: None,
         }
+    }
+
+    /// Read the group title, if any was assigned.
+    pub fn group_title(&self) -> Option<SharedString> {
+        self.title.clone()
+    }
+
+    /// Assign a stable identifier for deep links.
+    pub fn id(mut self, id: impl Into<SharedString>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Read the assigned identifier, if any.
+    pub fn group_id(&self) -> Option<SharedString> {
+        self.id.clone()
     }
 
     /// Set the label of the setting group, default is None.
