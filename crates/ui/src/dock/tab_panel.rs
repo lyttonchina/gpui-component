@@ -207,8 +207,40 @@ impl TabPanel {
         }
     }
 
+    /// Iterate every panel currently attached to this TabPanel.
+    ///
+    /// This is the small, generic hook downstream products use to find a
+    /// specific panel, such as the editor group's current preview tab, without
+    /// exposing the internal `panels` field.
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelView>> {
+        self.panels.iter()
+    }
+
     pub fn active_ix(&self) -> usize {
         self.active_ix
+    }
+
+    /// Activate an existing panel without detaching and re-inserting it.
+    pub fn activate_panel(
+        &mut self,
+        panel: Arc<dyn PanelView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ix) = self
+            .panels
+            .iter()
+            .position(|candidate| candidate.view() == panel.view())
+        else {
+            return false;
+        };
+        if ix == self.active_ix {
+            self.focus_active_panel(window, cx);
+            cx.notify();
+        } else {
+            self.set_active_ix(ix, window, cx);
+        }
+        true
     }
 
     fn set_active_ix(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -748,12 +780,18 @@ impl TabPanel {
                         .ix(ix)
                         .tab_bar_prefix(has_extend_dock_button)
                         .map(|this| {
-                            if let Some(tab_name) = panel.tab_name(cx) {
+                            if let Some(tab_title) = panel.tab_title(window, cx) {
+                                this.child(tab_title)
+                            } else if let Some(tab_name) = panel.tab_name(cx) {
                                 this.child(tab_name)
                             } else {
                                 this.child(panel.title(window, cx))
                             }
                         })
+                        .suffix_for_panel(
+                            panel.tab_suffix(window, cx),
+                            panel.tab_suffix_hover_only(cx),
+                        )
                         .selected(active)
                         .on_click(cx.listener({
                             let is_collapsed = self.collapsed;

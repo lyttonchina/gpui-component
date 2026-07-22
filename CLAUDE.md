@@ -34,8 +34,8 @@ cargo build
 # Lint check
 cargo clippy -- --deny warnings
 
-# Format check
-cargo fmt --check
+# Format only/check Rust files changed in the current worktree
+script/fmt-changed --check
 
 # Spell check
 typos
@@ -164,6 +164,11 @@ Text input system based on Rope data structure:
 - Reference macOS/Windows control API design for naming
 - AI-generated code must be refactored to match project style
 - Mark AI-generated portions when submitting PRs
+- This fork's upstream baseline is not workspace-format-clean. Do not run
+  `cargo fmt`, `cargo fmt --all`, or package-wide formatting by default.
+- Use `script/fmt-changed` to format only changed Rust files and
+  `script/fmt-changed --check` to verify them. See `AGENTS.md` for the complete
+  fork formatting policy.
 - When creating a PR, inspect previous PR titles in the repository and match
   that style. Do not blindly use conventional prefixes like `fix:` or `feat:`
   unless the existing PR title style uses them.

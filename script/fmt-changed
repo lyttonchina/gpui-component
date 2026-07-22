@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: script/fmt-changed [--check] [--base REVISION]
+
+Format only Rust files changed in the current worktree. The default base is
+HEAD, so staged, unstaged, and untracked Rust files are included.
+EOF
+}
+
+check=false
+base=HEAD
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      check=true
+      shift
+      ;;
+    --base)
+      if [[ $# -lt 2 ]]; then
+        echo "fmt-changed: --base requires a revision" >&2
+        exit 2
+      fi
+      base=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "fmt-changed: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repository_root=$(git rev-parse --show-toplevel)
+git rev-parse --verify "${base}^{commit}" >/dev/null
+cd "$repository_root"
+
+files=()
+while IFS= read -r -d '' file; do
+  files+=("$file")
+done < <(
+  git diff --name-only --diff-filter=ACMR -z "$base" -- '*.rs'
+  git ls-files --others --exclude-standard -z -- '*.rs'
+)
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  echo "fmt-changed: no changed Rust files"
+  exit 0
+fi
+
+echo "fmt-changed: processing ${#files[@]} Rust file(s)"
+printf '  %s\n' "${files[@]}"
+
+rustfmt_args=(
+  --config-path "$repository_root"
+  --config skip_children=true
+)
+if [[ "$check" == true ]]; then
+  rustfmt_args+=(--check)
+fi
+
+rustfmt "${rustfmt_args[@]}" "${files[@]}"
+
+if [[ "$check" == false ]]; then
+  git diff --check "$base" -- "${files[@]}"
+fi
