@@ -37,6 +37,7 @@ pub mod clipboard;
 pub mod collapsible;
 pub mod color_picker;
 pub mod combobox;
+pub mod context_key;
 pub mod count_badge;
 pub mod description_list;
 pub mod dialog;
@@ -83,6 +84,7 @@ pub mod tooltip;
 pub mod tree;
 
 pub use crate::Disableable;
+pub use context_key::{ContextKeyContext, ContextKeyExpr, ContextKeyService, ContextValue};
 pub use element_ext::*;
 pub use event::InteractiveElementExt;
 pub use focus_trap::FocusTrapElement;
@@ -120,6 +122,7 @@ pub fn init(cx: &mut App) {
     dock::init(cx);
     sheet::init(cx);
     combobox::init(cx);
+    cx.set_global(ContextKeyService::default());
     select::init(cx);
     input::init(cx);
     list::init(cx);
