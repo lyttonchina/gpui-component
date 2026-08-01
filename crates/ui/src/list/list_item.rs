@@ -1,9 +1,9 @@
 use crate::{ActiveTheme, Disableable, Icon, Selectable, Sizable as _, StyledExt, h_flex};
 use gpui::{
-    AnyElement, App, ClickEvent, Div, ElementId, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, RenderOnce, Stateful,
+    AnyElement, App, ClickEvent, DefiniteLength, Div, ElementId, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, RenderOnce, Stateful,
     StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    prelude::FluentBuilder as _, px,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -32,6 +32,12 @@ pub struct ListItem {
     secondary_selected: bool,
     confirmed: bool,
     check_icon: Option<Icon>,
+    /// Optional row height override used by the `h(...)` builder.
+    ///
+    /// PR-7b lets panels like the Git Panel source-control renderer
+    /// pin a fixed 22 px row to match VS Code's `scm.css` `.scm-row`
+    /// density without giving up the default padding-based row.
+    height: Option<DefiniteLength>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_mouse_down:
         HashMap<MouseButton, Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
@@ -55,6 +61,7 @@ impl ListItem {
             on_mouse_down: HashMap::new(),
             on_mouse_enter: None,
             check_icon: None,
+            height: None,
             suffix: None,
             children: SmallVec::new(),
         }
@@ -125,6 +132,29 @@ impl ListItem {
         self.on_mouse_enter = Some(Box::new(handler));
         self
     }
+
+    /// Pin the row to a fixed height.
+    ///
+    /// Defaults are derived from `px_3()` padding + content, so when the
+    /// row contains icon + label + suffix the natural height lands near
+    /// 22 px. For lists like the Source Control resource tree where
+    /// VS Code pins `.scm-row` to 22 px explicitly, prefer [`Self::compact`].
+    pub fn h(mut self, height: impl Into<DefiniteLength>) -> Self {
+        self.height = Some(height.into());
+        self
+    }
+
+    /// Opt into a 22 px row, matching VS Code's source-control row
+    /// density (`scm.css .monaco-list-row.scm-row { height: 22px }`).
+    ///
+    /// The Git Panel resource renderer uses this so the row height does
+    /// not depend on the icon's intrinsic height when the panel is
+    /// resized to a narrow column. PR-7b in
+    /// `docs/superpowers/git-panel/08-execution-pr-plan.md`.
+    pub fn compact(mut self) -> Self {
+        self.height = Some(px(22.).into());
+        self
+    }
 }
 
 impl Disableable for ListItem {
@@ -183,6 +213,7 @@ impl RenderOnce for ListItem {
             .relative()
             .items_center()
             .justify_between()
+            .when_some(self.height, |this, height| this.h(height))
             .refine_style(&self.style)
             .when(is_selectable, |this| {
                 this.when_some(self.on_click, |this, on_click| this.on_click(on_click))
@@ -250,5 +281,46 @@ impl RenderOnce for ListItem {
                     this
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::px;
+
+    #[test]
+    fn default_list_item_has_no_height_override() {
+        // Without calling `h(...)` or `compact()`, the builder keeps its
+        // natural padding-derived height. The height field defaults to
+        // `None`, which is what the render branches on.
+        let item = ListItem::new("git-panel-row");
+        assert!(item.height.is_none(), "no row-height override by default");
+    }
+
+    #[test]
+    fn compact_pins_row_to_22_px() {
+        // `compact()` is the Source Control resource-tree API surface
+        // (PR-7b in `docs/superpowers/git-panel/08-execution-pr-plan.md`).
+        // The accepted value is the fixed 22 px row VS Code uses in
+        // `scm.css .monaco-list-row.scm-row`.
+        let item = ListItem::new("git-panel-row").compact();
+        match item.height {
+            Some(DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(pixels))) => {
+                assert_eq!(pixels, px(22.), "compact must be exactly 22 px");
+            }
+            other => panic!("expected absolute 22 px height, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h_accepts_arbitrary_definite_length() {
+        let item = ListItem::new("git-panel-row").h(px(36.));
+        match item.height {
+            Some(DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(pixels))) => {
+                assert_eq!(pixels, px(36.), "h() must propagate the explicit value");
+            }
+            other => panic!("expected absolute 36 px height, got {other:?}"),
+        }
     }
 }

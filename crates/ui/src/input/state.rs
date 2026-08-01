@@ -388,6 +388,17 @@ pub struct InputState {
     pub(super) number_min: Option<f64>,
     /// The maximum value for [`super::NumberInput`]. See [`Self::max`].
     pub(super) number_max: Option<f64>,
+    /// Optional maximum number of characters allowed in the input text.
+    ///
+    /// When set, [`Self::insert_text`](#impl-InputState) will reject
+    /// insertions that would push the UTF-16 character count above this
+    /// limit. UI code can read [`Self::char_count`] and
+    /// [`Self::is_over_limit`] to render a status indicator (for example
+    /// the `"72 / 80"` counter shown by VS Code's Source Control commit
+    /// input). See [PR-7b] in the git-panel `v2-scm` rewrite.
+    ///
+    /// [PR-7b]: ../docs/superpowers/git-panel/08-execution-pr-plan.md
+    pub(super) max_chars: Option<usize>,
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
@@ -512,6 +523,7 @@ impl InputState {
             number_step: Some(NumberStep::Fixed(1.)),
             number_min: None,
             number_max: None,
+            max_chars: None,
             mode: InputMode::default(),
             last_layout: None,
             last_bounds: None,
@@ -1150,6 +1162,106 @@ impl InputState {
         debug_assert!(self.mode.is_single_line());
         self.number_max = Some(max);
         self
+    }
+
+    /// Set the maximum number of characters allowed in the input.
+    ///
+    /// When set, [`EntityInputHandler::replace_text_in_range`] rejects
+    /// insertions that would push the UTF-16 character count above this
+    /// limit. Existing text beyond the limit is left untouched. Pass
+    /// `None` (the default) to disable the limit.
+    ///
+    /// Pair with [`Self::char_count`] and [`Self::is_over_limit`] to
+    /// render a status indicator such as VS Code's
+    /// `"72 / 80"` commit-message counter.
+    pub fn max_chars(mut self, max: impl Into<Option<usize>>) -> Self {
+        self.max_chars = max.into();
+        self
+    }
+
+    /// Update the maximum number of characters allowed in the input.
+    ///
+    /// See [`Self::max_chars`]. Pass `None` to disable the limit. Re-renders
+    /// so any character-counter UI bound to the limit picks up the change.
+    pub fn set_max_chars(
+        &mut self,
+        max: impl Into<Option<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.max_chars = max.into();
+        cx.notify();
+    }
+
+    /// Return the UTF-16 character count of the current text.
+    ///
+    /// This matches the units used by the editor's IME/text input pipeline
+    /// so it is safe to compare against textual character limits (e.g.
+    /// VS Code's `git.inputValidationSubjectLength` ceiling of 72).
+    pub fn char_count(&self) -> usize {
+        self.text.chars().map(|c| c.len_utf16()).sum()
+    }
+
+    /// Return the configured maximum character count, or `None` if unset.
+    pub fn max_chars_limit(&self) -> Option<usize> {
+        self.max_chars
+    }
+
+    /// Return `true` when the configured maximum has been exceeded.
+    ///
+    /// Note: an input never accepts insertions that exceed the limit via
+    /// the [`EntityInputHandler`] path, so this returns `true` only when
+    /// the limit was lowered below the current text length or when the
+    /// text was seeded via [`Self::set_value`] while already over the
+    /// configured limit (e.g. populating from a saved commit template).
+    pub fn is_over_limit(&self) -> bool {
+        match self.max_chars {
+            Some(limit) => self.char_count() > limit,
+            None => false,
+        }
+    }
+
+    /// Truncate `new_text` so the resulting input length fits inside
+    /// [`Self::max_chars`] when the supplied range is replaced.
+    ///
+    /// If no limit is configured, `new_text` is returned unchanged.
+    /// Otherwise we walk the existing text in UTF-16 units to learn how
+    /// many units fall outside the replacement range, and clip the
+    /// incoming text so the new total never exceeds `limit`.
+    fn truncate_to_char_limit<'a>(
+        &self,
+        new_text: &'a str,
+        range_utf16: Option<&Range<usize>>,
+    ) -> &'a str {
+        let Some(limit) = self.max_chars else {
+            return new_text;
+        };
+
+        let replaced_utf16 = range_utf16
+            .map(|r| r.end.saturating_sub(r.start))
+            .unwrap_or(0);
+        let current_total = self.char_count();
+        // `outside_total` is the UTF-16 length of the text that will remain
+        // after the replacement. We use saturating subtraction so callers
+        // who supply a range larger than the current text are still safe.
+        let outside_total = current_total.saturating_sub(replaced_utf16);
+        let budget = limit.saturating_sub(outside_total);
+
+        let mut walked = 0usize;
+        let mut byte_len = 0usize;
+        for ch in new_text.chars() {
+            if walked + ch.len_utf16() > budget {
+                break;
+            }
+            walked += ch.len_utf16();
+            byte_len += ch.len_utf8();
+        }
+
+        if byte_len == new_text.len() {
+            new_text
+        } else {
+            &new_text[..byte_len]
+        }
     }
 
     /// Update the step value after construction, `None` to fall back to
@@ -2880,6 +2992,18 @@ impl EntityInputHandler for InputState {
             self.pause_blink_cursor(cx);
         }
 
+        // When `max_chars` is configured we clip the inserted text so the
+        // resulting UTF-16 length stays under the limit. Programmatic
+        // callers (e.g. `set_value`, completions) route through
+        // `replace_text_in_range_silent` and are allowed to temporarily
+        // exceed the limit; UI code can detect that with `is_over_limit`
+        // and surface a warning.
+        let new_text = if self.silent_replace_text {
+            new_text
+        } else {
+            self.truncate_to_char_limit(new_text, range_utf16.as_ref())
+        };
+
         // NOTE: The normalization keeps the UTF-16 length, but may change the
         // UTF-8 byte length, so all the byte-offset calculations below must
         // use the normalized text.
@@ -3846,6 +3970,98 @@ ORDER BY id
                 // clamped + collapsed
                 s.set_selected_range(100..100, cx);
                 assert_eq!(s.selected_range(), 11..11);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_char_count_counts_utf16_units(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                assert_eq!(state.char_count(), 0, "empty input has 0 chars");
+
+                state.set_value("hello", window, cx);
+                assert_eq!(state.char_count(), 5, "ASCII text matches byte length");
+
+                state.set_value("héllo", window, cx);
+                assert_eq!(state.char_count(), 5, "combining marks count as 1 char");
+
+                // Emoji are surrogate pairs (2 UTF-16 units each).
+                state.set_value("💝", window, cx);
+                assert_eq!(state.char_count(), 2, "emoji is a UTF-16 surrogate pair");
+                assert_eq!(state.value().to_string(), "💝");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_max_chars_blocks_paste_overflow(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.max_chars(5));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hi", window, cx);
+                assert_eq!(state.char_count(), 2);
+                assert!(!state.is_over_limit(), "below limit");
+                assert_eq!(state.max_chars_limit(), Some(5));
+
+                // `set_value` always wins — even when the seeded text is
+                // over the limit we keep it intact so the UI can flag and
+                // let the user fix it. set_value routes through
+                // `replace_text_in_range_silent`.
+                state.set_value("hellow", window, cx);
+                assert_eq!(
+                    state.char_count(),
+                    6,
+                    "set_value must keep text even when over the configured limit"
+                );
+                assert!(state.is_over_limit());
+
+                // Reset to a smaller value, then use the IME path to
+                // verify paste truncation. We switch into the focused
+                // entity-input-handler path by toggling a controllable
+                // cursor range and dispatching through the trait method.
+                state.set_value("hi", window, cx);
+                assert_eq!(state.char_count(), 2);
+
+                // Trigger the IME-driven path via the trait. We have to
+                // drop out of `silent_replace_text` so the truncation
+                // kicks in.
+                state.silent_replace_text = false;
+                state.replace_text_in_range(Some(2..2), "lo world!", window, cx);
+                assert_eq!(
+                    state.value(),
+                    "hilo ",
+                    "IME paste must be clipped so total stays <= max_chars (clipped length is 3 chars: 'lo ')"
+                );
+                assert_eq!(state.char_count(), 5);
+                assert!(!state.is_over_limit());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_value_over_limit_reports_over_limit(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_max_chars(Some(3), window, cx);
+                state.set_value("abcdef", window, cx);
+                assert_eq!(state.char_count(), 6);
+                assert!(
+                    state.is_over_limit(),
+                    "value seeded above the limit counts as over limit",
+                );
             });
         });
     }
