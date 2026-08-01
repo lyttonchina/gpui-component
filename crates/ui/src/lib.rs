@@ -24,6 +24,7 @@ mod window_ext;
 pub(crate) mod actions;
 
 pub mod accordion;
+pub mod action_bar;
 pub mod alert;
 pub mod animation;
 pub mod avatar;
@@ -36,6 +37,7 @@ pub mod clipboard;
 pub mod collapsible;
 pub mod color_picker;
 pub mod combobox;
+pub mod count_badge;
 pub mod description_list;
 pub mod dialog;
 pub mod dock;

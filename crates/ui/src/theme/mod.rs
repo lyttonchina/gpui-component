@@ -12,11 +12,13 @@ use std::{
 };
 
 mod color;
+mod git_colors;
 mod registry;
 mod schema;
 mod theme_color;
 
 pub use color::*;
+pub use git_colors::GitColors;
 pub use registry::*;
 pub use schema::*;
 pub use theme_color::*;
@@ -46,6 +48,12 @@ pub struct Theme {
     pub colors: ThemeColor,
     #[serde(default)]
     pub tokens: ThemeTokens,
+    /// Semantic color tokens for Source Control panels. Resolved from the
+    /// active palette's red / green / yellow / blue / muted foreground so the
+    /// state colors automatically adapt to light / dark mode and any custom
+    /// theme overrides.
+    #[serde(default)]
+    pub git: GitColors,
     pub highlight_theme: Arc<HighlightTheme>,
     pub light_theme: Rc<ThemeConfig>,
     pub dark_theme: Rc<ThemeConfig>,
@@ -207,6 +215,13 @@ impl Theme {
 
 impl From<&ThemeColor> for Theme {
     fn from(colors: &ThemeColor) -> Self {
+        let git = GitColors::from_palette(
+            colors.green,
+            colors.yellow,
+            colors.red,
+            colors.blue,
+            colors.muted_foreground,
+        );
         Theme {
             mode: ThemeMode::default(),
             transparent: Hsla::transparent_black(),
@@ -232,6 +247,7 @@ impl From<&ThemeColor> for Theme {
             list: ListSettings::default(),
             colors: *colors,
             tokens: ThemeTokens::from(colors),
+            git,
             light_theme: Rc::new(ThemeConfig::default()),
             dark_theme: Rc::new(ThemeConfig::default()),
             highlight_theme: HighlightTheme::default_light(),

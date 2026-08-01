@@ -9,7 +9,7 @@ use crate::highlighter::{HighlightTheme, HighlightThemeStyle};
 use super::color::{
     try_parse_background, try_parse_background_clamped, try_parse_color, try_parse_theme_color,
 };
-use super::{Colorize, Theme, ThemeColor, ThemeMode, ThemeToken, ThemeTokens};
+use super::{Colorize, GitColors, Theme, ThemeColor, ThemeMode, ThemeToken, ThemeTokens};
 
 fn try_parse_theme_token(value: &str) -> anyhow::Result<ThemeToken> {
     Ok(ThemeToken::new(
@@ -937,6 +937,16 @@ impl Theme {
         }
 
         self.tokens = self.colors.apply_config(&config, &default_colors);
+        // Refresh semantic Source Control tokens so they track any palette
+        // overrides applied by the new config (e.g. custom `green` for a
+        // dark theme).
+        self.git = GitColors::from_palette(
+            self.colors.green,
+            self.colors.yellow,
+            self.colors.red,
+            self.colors.blue,
+            self.colors.muted_foreground,
+        );
         self.mode = config.mode;
     }
 }
