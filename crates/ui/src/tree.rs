@@ -723,9 +723,10 @@ impl Render for TreeState {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_item = self.render_item.clone();
         let state = cx.entity().clone();
+        let entity_id = state.entity_id();
 
         div()
-            .id("tree-state")
+            .id(("tree-state", entity_id))
             .size_full()
             .relative()
             .context_menu({
@@ -757,7 +758,7 @@ impl Render for TreeState {
                 }
             })
             .child(
-                uniform_list("entries", self.entries.len(), {
+                uniform_list(("entries", entity_id), self.entries.len(), {
                     cx.processor(move |state, visible_range: Range<usize>, window, cx| {
                         let mut items = Vec::with_capacity(visible_range.len());
                         for ix in visible_range {
