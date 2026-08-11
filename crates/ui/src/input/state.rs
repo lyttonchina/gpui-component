@@ -407,6 +407,19 @@ pub struct InputState {
     pub(super) editor_scrollbar_paddings: Cell<Edges<Pixels>>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
     pub(super) text_align: TextAlign,
+    /// PR-24 (rusq ui-sync-block-optimize): scroll-event throttle queue.
+    ///
+    /// `on_scroll_wheel` fires multiple times per animation frame on
+    /// macOS / Linux trackpads and Windows Precision touchpads; without
+    /// throttling, each event calls `cx.notify()` synchronously and
+    /// forces an immediate `Render::render` re-run on the foreground
+    /// thread. `pending_scroll_offset` caches the most-recent target
+    /// offset so a single `cx.notify()` per frame is enough. The flush
+    /// is scheduled via [`Self::scroll_flush_task`], which is dropped
+    /// (and re-spawned) on each new event so only the latest offset
+    /// wins.
+    pub(super) pending_scroll_offset: Option<Point<Pixels>>,
+    pub(super) scroll_flush_task: Option<Task<()>>,
 
     /// The mask pattern for formatting the input text
     pub(crate) mask_pattern: MaskPattern,
@@ -539,6 +552,9 @@ impl InputState {
             }),
             editor_scrollbar_snapshot: Cell::new(None),
             deferred_scroll_offset: None,
+            // PR-24: throttle queue initialised empty.
+            pending_scroll_offset: None,
+            scroll_flush_task: None,
             preferred_column: None,
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
@@ -2007,8 +2023,17 @@ impl InputState {
             .unwrap_or(window.line_height());
         let delta = event.delta.pixel_delta(line_height);
 
+        // PR-24: ignore zero-delta scroll events. Trackpads frequently
+        // emit zero-delta events between actual scrolls (fingers
+        // momentarily stationary on the touch surface); without the
+        // early-return each one still calls `cx.notify()` and triggers
+        // a `Render::render` re-run.
+        if delta == gpui::Point::default() {
+            return;
+        }
+
         let old_offset = self.scroll_handle.offset();
-        self.update_scroll_offset(Some(old_offset + delta), cx);
+        self.queue_scroll_offset(old_offset + delta, cx);
 
         // Only stop propagation if the offset actually changed
         if self.scroll_handle.offset() != old_offset {
@@ -2016,6 +2041,37 @@ impl InputState {
         }
 
         self.diagnostic_popover = None;
+    }
+
+    /// PR-24: schedule the new scroll offset for the next animation
+    /// frame instead of mutating the [`ScrollHandle`] synchronously.
+    /// Multiple `ScrollWheelEvent`s between two GPUI frames collapse
+    /// onto a single `cx.notify()`, which is the bottleneck the panel
+    /// scroll-path observability study in `07-scroll-jank-fix-plan.md`
+    /// §2.5 (E-6) flagged. The flush task is dropped on every call so
+    /// only the latest scheduled offset survives.
+    pub(super) fn queue_scroll_offset(
+        &mut self,
+        offset: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_scroll_offset = Some(offset);
+        // Drop the previous flush — only the latest scheduled offset
+        // should win. Dropping the task is the standard GPUI pattern
+        // for "cancel and re-schedule" on a foreground `cx.spawn`.
+        self.scroll_flush_task = Some(cx.spawn(async move |input, cx| {
+            // PR-24: defer one frame so consecutive scroll events
+            // emitted within the same animation frame collapse onto a
+            // single `update_scroll_offset` call.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(0))
+                .await;
+            let _ = input.update(cx, |this, cx| {
+                if let Some(pending) = this.pending_scroll_offset.take() {
+                    this.update_scroll_offset(Some(pending), cx);
+                }
+            });
+        }));
     }
 
     pub(super) fn update_scroll_offset(
@@ -2042,6 +2098,14 @@ impl InputState {
             offset.y.clamp(safe_y_range.start, safe_y_range.end)
         };
         offset.x = offset.x.clamp(safe_x_range.start, safe_x_range.end);
+        // PR-24: skip `set_offset` + `cx.notify()` when the resolved
+        // offset hasn't actually moved. `clamp` can collapse two
+        // distinct incoming values onto the same boundary, so the
+        // pointer-equality fast-path catches "scroll past the end" /
+        // "scroll past the start" sequences without re-rendering.
+        if self.scroll_handle.offset() == offset {
+            return;
+        }
         self.scroll_handle.set_offset(offset);
         cx.notify();
     }
