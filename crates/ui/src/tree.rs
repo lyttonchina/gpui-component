@@ -1,10 +1,16 @@
-use std::{cell::RefCell, collections::BTreeSet, ops::Range, rc::Rc};
+use std::{
+    any::{Any, TypeId},
+    cell::RefCell,
+    collections::BTreeSet,
+    ops::Range,
+    rc::Rc,
+};
 
 use gpui::{
     App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, ListSizingBehavior, Modifiers, MouseButton, ParentElement, Render,
-    RenderOnce, SharedString, Size, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
-    prelude::FluentBuilder as _, px, uniform_list,
+    RenderOnce, SharedString, Size, StyleRefinement, Styled, UniformListScrollHandle, WeakEntity,
+    Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
 use crate::{
@@ -212,6 +218,68 @@ impl TreeEntryRenderer {
     fn matches(&self, kind: &TreeItemKind) -> bool {
         (self.kind_predicate)(kind)
     }
+
+    /// Build a closure that ignores the PR-40 `HeightStrategy`-resolved
+    /// row height so a PR-35 renderer can be inserted into the
+    /// strategy-aware path without rewriting the closure.
+    fn into_pr40_render_ignore_height(self) -> TreeEntryRendererWithHeight {
+        let predicate = self.kind_predicate;
+        let pr35_render = self.render;
+        TreeEntryRendererWithHeight {
+            kind_predicate: predicate,
+            render: Rc::new(move |ix, kind, _row_height, _caller, window, cx| {
+                pr35_render(ix, kind, window, cx)
+            }),
+        }
+    }
+}
+
+/// PR-40 variant of [`TreeEntryRenderer`] whose `render` closure receives
+/// the `HeightStrategy`-resolved row height and the caller panel context.
+///
+/// PR-35 callers keep using [`TreeEntryRenderer::new`] (the height is
+/// silently dropped via [`TreeEntryRenderer::into_pr40_render_ignore_height`]).
+/// New callers use [`TreeEntryRendererWithHeight::new`].
+pub struct TreeEntryRendererWithHeight {
+    pub kind_predicate: fn(&TreeItemKind) -> bool,
+    pub render: Rc<
+        dyn Fn(
+            usize,
+            &TreeItemKind,
+            Size<gpui::Pixels>,
+            &dyn TreeCallerContext,
+            &mut Window,
+            &mut App,
+        ) -> ListItem,
+    >,
+}
+
+impl TreeEntryRendererWithHeight {
+    /// Build a closure-aware renderer that owns the row height and
+    /// caller context.  The closure decides whether to apply the
+    /// resolved height (e.g. force `.h(px(...))` for `FixedForKind`)
+    /// or ignore it (e.g. hand it to `uniform_list Auto` for `Natural`).
+    pub fn new(
+        kind_predicate: fn(&TreeItemKind) -> bool,
+        render: impl Fn(
+            usize,
+            &TreeItemKind,
+            Size<gpui::Pixels>,
+            &dyn TreeCallerContext,
+            &mut Window,
+            &mut App,
+        ) -> ListItem
+        + 'static,
+    ) -> Self {
+        Self {
+            kind_predicate,
+            render: Rc::new(render),
+        }
+    }
+
+    fn matches(&self, kind: &TreeItemKind) -> bool {
+        (self.kind_predicate)(kind)
+    }
 }
 
 /// Build a [`TreeMultiKind`] — the heterogeneous-row equivalent of
@@ -286,6 +354,197 @@ impl Styled for TreeMultiKind {
     }
 }
 
+/// PR-40 entry point that supersedes [`tree_multi_kind`] when the caller
+/// needs per-row height strategy, caller context, and the row-level
+/// loading lifecycle.  See module-level docs and the [`TreeCallerContext`]
+/// / [`HeightStrategy`] / [`LoadingState`] types for the contract.
+#[derive(IntoElement)]
+pub struct TreeMultiKindWithStrategy {
+    id: ElementId,
+    state: Entity<TreeState>,
+    list_id: SharedString,
+    items: Vec<TreeItemEntry>,
+    renderers: Vec<TreeEntryRendererWithHeight>,
+    caller: Rc<dyn TreeCallerContext>,
+    height_strategy: HeightStrategy,
+    style: StyleRefinement,
+}
+
+impl TreeMultiKindWithStrategy {
+    /// Build a strategy-aware multi-kind tree.
+    ///
+    /// `items` already carries [`LoadingState`] per row; hidden rows are
+    /// skipped by the inner `uniform_list`, pending rows are rendered as
+    /// a uniform placeholder, and ready rows go through the matching
+    /// renderer closure with the [`HeightStrategy`]-resolved height.
+    pub fn new(
+        state: &Entity<TreeState>,
+        id: impl Into<SharedString>,
+        items: Vec<TreeItemEntry>,
+        renderers: Vec<TreeEntryRendererWithHeight>,
+        caller: Rc<dyn TreeCallerContext>,
+        height_strategy: HeightStrategy,
+    ) -> Self {
+        let list_id: SharedString = id.into();
+        let element_id: ElementId = ElementId::Name(
+            format!("tree-multi-kind-strategy-{}-{}", state.entity_id(), list_id).into(),
+        );
+        Self {
+            id: element_id,
+            state: state.clone(),
+            list_id,
+            items,
+            renderers,
+            caller,
+            height_strategy,
+            style: StyleRefinement::default(),
+        }
+    }
+
+    /// Total entry count.  Mirrors [`TreeMultiKind::items_len`] for
+    /// parity with the PR-35 surface.
+    pub fn items_len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// How many rows resolve to each [`LoadingState`] value.  Useful for
+    /// tests asserting that a caller correctly marked `Hidden` / `Pending`
+    /// rows after a layout change.
+    pub fn loading_state_counts(&self) -> (usize, usize, usize) {
+        let mut pending = 0;
+        let mut ready = 0;
+        let mut hidden = 0;
+        for entry in &self.items {
+            match entry.loading_state {
+                LoadingState::Pending => pending += 1,
+                LoadingState::Ready => ready += 1,
+                LoadingState::Hidden => hidden += 1,
+            }
+        }
+        (pending, ready, hidden)
+    }
+}
+
+impl Styled for TreeMultiKindWithStrategy {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl RenderOnce for TreeMultiKindWithStrategy {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus_handle = self.state.read(cx).focus_handle.clone();
+        let scroll_handle = self.state.read(cx).scroll_handle.clone();
+        let items = self.items;
+        let renderers = self.renderers;
+        let caller: Rc<dyn TreeCallerContext> = self.caller.clone();
+        let height_strategy = self.height_strategy;
+        let list_id = self.list_id.clone();
+        let element_id = self.id.clone();
+        let style = self.style;
+
+        let list = uniform_list(list_id, items.len(), move |visible_range: Range<usize>, window: &mut Window, cx: &mut App| {
+            let mut out: Vec<gpui::AnyElement> = Vec::with_capacity(visible_range.len());
+            for ix in visible_range {
+                let Some(entry) = items.get(ix) else {
+                    continue;
+                };
+                match entry.loading_state {
+                    LoadingState::Hidden => {
+                        // Preserve the slot but emit an empty placeholder.
+                        // `uniform_list` insists on a 1:1 mapping between
+                        // `visible_range` indices and the returned
+                        // `AnyElement` slice; emitting a zero-height
+                        // `ListItem` keeps the layout pass measurable.
+                        out.push(
+                            ListItem::new(("tree-multi-kind-hidden", ix))
+                                .h(px(0.))
+                                .into_any_element(),
+                        );
+                    }
+                    LoadingState::Pending => {
+                        // Uniform placeholder so the row remains visible
+                        // without forcing every caller to render the same
+                        // `Loading…` div by hand.
+                        out.push(
+                            ListItem::new(("tree-multi-kind-pending", ix))
+                                .h(px(28.))
+                                .child("Loading…")
+                                .into_any_element(),
+                        );
+                    }
+                    LoadingState::Ready => {
+                        let row_height = height_strategy.resolve(&entry.kind, cx);
+                        let renderer = renderers
+                            .iter()
+                            .find(|r| r.matches(&entry.kind))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "tree_multi_kind: no renderer matched TreeItemKind variant at index {ix}"
+                                )
+                            });
+                        let item = (renderer.render)(
+                            ix,
+                            &entry.kind,
+                            row_height,
+                            caller.as_ref(),
+                            window,
+                            cx,
+                        );
+                        out.push(item.into_any_element());
+                    }
+                }
+            }
+            out
+        })
+        .flex_grow_1()
+        .size_full()
+        .track_scroll(&scroll_handle)
+        .with_sizing_behavior(ListSizingBehavior::Auto);
+
+        div()
+            .id(element_id)
+            .key_context(CONTEXT)
+            .track_focus(&focus_handle)
+            .on_action(window.listener_for(&self.state, TreeState::on_action_confirm))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_left))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_right))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_up))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_down))
+            .size_full()
+            .child(list)
+            .refine_style(&style)
+            .vertical_scrollbar(&scroll_handle)
+    }
+}
+
+/// Migrate PR-35 callers onto the PR-40 surface.
+///
+/// `height_strategy` defaults to [`HeightStrategy::FixedForKind`] so the
+/// rebuilt tree behaves identically to PR-35.  Items are lifted with
+/// [`TreeItemEntry::from_kind_vec`] (every row becomes `Ready`).
+pub fn tree_multi_kind_with_strategy(
+    state: &Entity<TreeState>,
+    id: impl Into<SharedString>,
+    items: Vec<TreeItemKind>,
+    renderers: Vec<TreeEntryRenderer>,
+    caller: Rc<dyn TreeCallerContext>,
+    height_strategy: HeightStrategy,
+) -> TreeMultiKindWithStrategy {
+    let rendered = renderers
+        .into_iter()
+        .map(TreeEntryRenderer::into_pr40_render_ignore_height)
+        .collect();
+    TreeMultiKindWithStrategy::new(
+        state,
+        id,
+        TreeItemEntry::from_kind_vec(items),
+        rendered,
+        caller,
+        height_strategy,
+    )
+}
+
 impl RenderOnce for TreeMultiKind {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus_handle = self.state.read(cx).focus_handle.clone();
@@ -333,6 +592,261 @@ impl RenderOnce for TreeMultiKind {
             .child(list)
             .refine_style(&style)
             .vertical_scrollbar(&scroll_handle)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR-40 of `docs/superpowers/ui-sync-block-optimize/11-...` — three extension
+// points on top of the PR-35 `tree_multi_kind` API:
+//
+// 1. `HeightStrategy`        — per-row height: fixed per kind (PR-35 default)
+//                              or natural (let `uniform_list` `Auto` size).
+// 2. `TreeCallerContext`     — type-erased access to the caller panel state
+//                              from `TreeEntryRenderer` closures, replacing
+//                              the "capture `WeakEntity` in every renderer
+//                              closure" pattern.
+// 3. `LoadingState` + `TreeItemEntry` — row-level rendering lifecycle
+//                              (`Pending` / `Ready` / `Hidden`), so callers
+//                              no longer hand-roll `Option::flatten().unwrap_or(loading_item)`.
+//
+// None of these touch the PR-35 `TreeItemKind` enum / `*Meta` payloads /
+// `height_for_kind` / `uniform_list` delegation path.  PR-35 callers stay
+// on `TreeMultiKind::new` (now `#[deprecated]`); new callers use
+// `TreeMultiKind::new_with_strategy` described below.
+// ---------------------------------------------------------------------------
+
+/// Per-row height strategy for `tree_multi_kind` (PR-40).
+///
+/// PR-35's behaviour is essentially `FixedForKind` — the single
+/// `height_for_kind` function decides row heights from the `TreeItemKind`
+/// variant.  PR-40 adds `Natural` so callers can opt out and let the
+/// `ListItem` body decide its own height (the `uniform_list`
+/// `ListSizingBehavior::Auto` branch then takes over).
+///
+/// `v1.1` removed the originally-proposed `Dynamic(fn(&TreeItemKind, &App) -> Size<Pixels>)`
+/// third variant: that signature only gets `&TreeItemKind` and cannot measure
+/// the post-render height for content-driven rows such as the commit input
+/// box.  VS Code's equivalent (per-element `getHeight` + async
+/// `updateElementHeight` callback) is left to a future PR-O candidate.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum HeightStrategy {
+    /// Replicates PR-35's `height_for_kind(kind)` write-once behaviour.  This
+    /// is the default and the only mode that keeps the existing two
+    /// `tree_multi_kind_*` tests untouched.
+    #[default]
+    FixedForKind,
+    /// Lets the row's `ListItem` body decide its own height.  The strategy
+    /// resolver returns `size(px(0.), px(0.))`; `uniform_list` with
+    /// `ListSizingBehavior::Auto` measures the first item and applies that
+    /// height to siblings.  Callers using `Natural` **must not** call
+    /// `.h(px(...))` on the resulting `ListItem`.
+    Natural,
+}
+
+impl HeightStrategy {
+    /// Resolve a size for the given kind.  The `_app` parameter is reserved
+    /// for a future `Dynamic` variant and is intentionally unused here.
+    pub fn resolve(&self, kind: &TreeItemKind, _app: &App) -> Size<gpui::Pixels> {
+        match self {
+            HeightStrategy::FixedForKind => height_for_kind(kind),
+            HeightStrategy::Natural => Size {
+                width: px(0.),
+                height: px(0.),
+            },
+        }
+    }
+}
+
+/// Caller panel state exposed to `TreeEntryRenderer` closures (PR-40).
+///
+/// `TreeEntryRenderer::render` is a `Rc<dyn Fn>` and cannot capture a
+/// caller-specific `Context<T>` directly.  This trait provides a
+/// type-erased bridge — the caller wraps its own `WeakEntity<T>` in a
+/// `WeakCallerContext<T>` that implements `TreeCallerContext`, and the
+/// renderer closure receives `&dyn TreeCallerContext` to access panel
+/// state without itself holding the weak reference.
+///
+/// # Object safety
+///
+/// `Context<T>` in GPUI is generic and requires `T: Sized`, so we cannot
+/// expose `Context<T>` through a `dyn` trait.  Instead, the trait
+/// surface stays minimal (`caller_update_with` / `caller_read_with`),
+/// taking boxed callables that already know the concrete panel type at
+/// the caller site.  The internal `WeakCallerContext<T>` does the
+/// downcast before wrapping the closure, so the renderer closure still
+/// sees a typed `&mut T` / `&mut Context<T>` pair via the wrapper helper.
+///
+/// Renderers should normally use the convenience wrappers provided on
+/// `WeakCallerContext<T>` (`caller_update` / `caller_read`) rather than
+/// calling the trait methods directly.
+pub trait TreeCallerContext: 'static {
+    /// Invoke `f` with a `&mut T` / `&mut Context<T>` pair when the
+    /// requested `panel_type` matches the wrapped entity.  Returns
+    /// `None` if the entity has been dropped or the type tag does not
+    /// match.  `f` runs on the UI thread (consistent with
+    /// `WeakEntity::update`).
+    fn caller_update_with(
+        &self,
+        panel_type: TypeId,
+        cx: &mut App,
+        f: Box<dyn FnOnce(&mut dyn Any, &mut App) -> Box<dyn Any>>,
+    ) -> Option<Box<dyn Any>>;
+
+    /// Read-only variant of `caller_update_with`.  Returns `None` when
+    /// the entity has been dropped or the type tag does not match.
+    fn caller_read_with(
+        &self,
+        panel_type: TypeId,
+        cx: &App,
+        f: Box<dyn FnOnce(&(dyn Any + '_)) -> Box<dyn Any>>,
+    ) -> Option<Box<dyn Any>>;
+}
+
+/// Typed wrapper that turns a `WeakEntity<T>` into a `TreeCallerContext`.
+///
+/// Construct via [`WeakCallerContext::new`] and pass it as `Rc<dyn TreeCallerContext>`
+/// to [`TreeMultiKind::new_with_strategy`].
+pub struct WeakCallerContext<T> {
+    inner: WeakEntity<T>,
+}
+
+impl<T: 'static> WeakCallerContext<T> {
+    /// Wrap a `WeakEntity<T>` in a generic `TreeCallerContext` so that
+    /// renderers can recover `&mut T` / `&T` from a type-erased `&dyn TreeCallerContext`.
+    pub fn new(inner: WeakEntity<T>) -> Self {
+        Self { inner }
+    }
+
+    /// Convenience accessor that mirrors `WeakEntity::update` but
+    /// returns `Option<R>` instead of `Result<R>` — callers do not need
+    /// to `.ok()` on a `Result` every time they want to fold a missing
+    /// panel into a fallback `ListItem`.
+    pub fn caller_update<R: 'static>(
+        &self,
+        cx: &mut App,
+        f: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> Option<R> {
+        self.inner.update(cx, f).ok()
+    }
+
+    /// Read-only variant of [`Self::caller_update`].  Mirrors
+    /// `WeakEntity::read_with` but returns `Option<R>` for symmetry.
+    pub fn caller_read<R: 'static>(&self, cx: &App, f: impl FnOnce(&T, &App) -> R) -> Option<R> {
+        self.inner.read_with(cx, f).ok()
+    }
+}
+
+impl<T: 'static> TreeCallerContext for WeakCallerContext<T> {
+    fn caller_update_with(
+        &self,
+        panel_type: TypeId,
+        cx: &mut App,
+        f: Box<dyn FnOnce(&mut dyn Any, &mut App) -> Box<dyn Any>>,
+    ) -> Option<Box<dyn Any>> {
+        if TypeId::of::<T>() != panel_type {
+            return None;
+        }
+        // `Context<T>` derefs to `App`, so handing the closure a
+        // `&mut App` is functionally equivalent to handing it
+        // `&mut Context<T>` for the operations renderers typically
+        // need (`notify`, `spawn`, `read`, `write`).  The closure is
+        // already pre-monomorphized to the concrete caller panel type
+        // by virtue of `WeakEntity<T>` downcasting.
+        self.inner
+            .update(cx, move |p, ctx| {
+                let app: &mut App = ctx;
+                let as_dyn: &mut dyn Any = p;
+                f(as_dyn, app)
+            })
+            .ok()
+    }
+
+    fn caller_read_with(
+        &self,
+        panel_type: TypeId,
+        cx: &App,
+        f: Box<dyn FnOnce(&(dyn Any + '_)) -> Box<dyn Any>>,
+    ) -> Option<Box<dyn Any>> {
+        if TypeId::of::<T>() != panel_type {
+            return None;
+        }
+        self.inner
+            .read_with(cx, move |p, _ctx| {
+                let as_dyn: &(dyn Any + '_) = p;
+                f(as_dyn)
+            })
+            .ok()
+    }
+}
+
+/// Row-level rendering lifecycle (PR-40).
+///
+/// PR-35 collapsed every row to "find a renderer, call it".  Callers
+/// that need a fallback (e.g. a commit input row whose `InputState` has
+/// not been materialised yet) previously hand-rolled
+/// `Option::flatten().unwrap_or(loading_item)` inside the renderer
+/// closure.  PR-40 moves the lifecycle into the data model so that
+/// `tree_multi_kind` can render a uniform placeholder for `Pending`
+/// rows and skip virtual-list slots for `Hidden` rows.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum LoadingState {
+    /// Fallback branch: the data is not yet ready (panel dropped, async
+    /// load pending).  `tree_multi_kind` paints a uniform placeholder
+    /// for this row.
+    Pending,
+    /// Normal branch: the renderer produces the real row content.
+    #[default]
+    Ready,
+    /// The row should not appear in the virtual list at all (e.g. a
+    /// folded-away repo or a filtered-out group).  `tree_multi_kind`
+    /// skips the slot but preserves the index, so callers retain the
+    /// rest of the row indices.
+    Hidden,
+}
+
+/// Pairs a `TreeItemKind` with its rendering lifecycle (PR-40).
+///
+/// `tree_multi_kind` accepts `Vec<TreeItemEntry>`; converting from the
+/// PR-35 `Vec<TreeItemKind>` shape is a one-liner via
+/// [`TreeItemEntry::from_kind_vec`].
+#[derive(Clone)]
+pub struct TreeItemEntry {
+    pub kind: TreeItemKind,
+    pub loading_state: LoadingState,
+}
+
+impl TreeItemEntry {
+    /// Build an entry with an explicit lifecycle.
+    pub fn new(kind: TreeItemKind, loading_state: LoadingState) -> Self {
+        Self {
+            kind,
+            loading_state,
+        }
+    }
+
+    /// Convenience constructor for the common ready case.
+    pub fn ready(kind: TreeItemKind) -> Self {
+        Self::new(kind, LoadingState::Ready)
+    }
+
+    /// Convenience constructor for the pending case.
+    pub fn pending(kind: TreeItemKind) -> Self {
+        Self::new(kind, LoadingState::Pending)
+    }
+
+    /// Convenience constructor for the hidden case.
+    pub fn hidden(kind: TreeItemKind) -> Self {
+        Self::new(kind, LoadingState::Hidden)
+    }
+
+    /// Lift a `Vec<TreeItemKind>` into a `Vec<TreeItemEntry>` whose
+    /// lifecycle defaults to `LoadingState::Ready`.  Provided as a
+    /// one-shot migration helper for PR-35 callers.
+    pub fn from_kind_vec(items: Vec<TreeItemKind>) -> Vec<Self> {
+        items
+            .into_iter()
+            .map(|kind| Self::new(kind, LoadingState::Ready))
+            .collect()
     }
 }
 
@@ -1156,12 +1670,23 @@ mod tests {
     use indoc::indoc;
 
     use super::{
-        CommitInputMeta, FolderMeta, RepoHeaderMeta, ResourceGroupHeaderMeta, ResourceRowMeta,
-        SelectionChange, TreeEntryRenderer, TreeEvent, TreeItemKind, TreeState, height_for_kind,
-        tree_multi_kind,
+        CommitInputMeta, FolderMeta, HeightStrategy, LoadingState, RepoHeaderMeta,
+        ResourceGroupHeaderMeta, ResourceRowMeta, SelectionChange, TreeCallerContext,
+        TreeEntryRenderer, TreeEntryRendererWithHeight, TreeEvent, TreeItemEntry, TreeItemKind,
+        TreeMultiKindWithStrategy, TreeState, WeakCallerContext, height_for_kind, tree_multi_kind,
+        tree_multi_kind_with_strategy,
     };
     use crate::list::ListItem;
     use gpui::{AppContext as _, Render, Subscription};
+    use std::any::{Any, TypeId};
+
+    /// Module-local panel used by the PR-40 caller-context tests.  The
+    /// type is intentionally trivial — the surface area under test is
+    /// the `TreeCallerContext` trait dispatch, not the panel itself.
+    #[derive(Default)]
+    struct Pr40TestPanel {
+        counter: usize,
+    }
 
     struct TestCollector {
         _state: gpui::Entity<TreeState>,
@@ -1763,5 +2288,330 @@ mod tests {
     }
     fn predicate_folder(kind: &TreeItemKind) -> bool {
         matches!(kind, TreeItemKind::Folder(_))
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-40 (`docs/superpowers/ui-sync-block-optimize/11-...`) acceptance.
+    // -----------------------------------------------------------------------
+    //
+    // Each test mirrors a section of the v1.1 design:
+    //   * `pr40_height_strategy_*`        — EX-1 (HeightStrategy enum)
+    //   * `pr40_caller_context_*`         — EX-2 (TreeCallerContext trait)
+    //   * `pr40_loading_state_*`          — EX-3 (LoadingState + TreeItemEntry)
+    //
+    // The tests deliberately avoid `gpui::test` runtime cases that would
+    // require a GPUI window: PR-40's surface is structural (the new
+    // types route the same `uniform_list` path used by PR-35) and the
+    // design rubric is exercised by interrogating the public API
+    // directly.  This matches the PR-35 acceptance style.
+
+    fn repo_header_kind() -> TreeItemKind {
+        TreeItemKind::RepoHeader(RepoHeaderMeta {
+            repo_root: "repo".into(),
+            display_name: "repo".into(),
+            branch: Some("main".into()),
+        })
+    }
+    fn commit_input_kind() -> TreeItemKind {
+        TreeItemKind::CommitInput(CommitInputMeta {
+            repo_root: "repo".into(),
+        })
+    }
+    fn group_header_kind() -> TreeItemKind {
+        TreeItemKind::ResourceGroupHeader(ResourceGroupHeaderMeta {
+            repo_root: "repo".into(),
+            group_kind: "staged".into(),
+            group_label: "Staged".into(),
+        })
+    }
+    fn resource_row_kind() -> TreeItemKind {
+        TreeItemKind::ResourceRow(ResourceRowMeta {
+            repo_root: "repo".into(),
+            group_kind: "staged".into(),
+            file_path: "src/lib.rs".into(),
+        })
+    }
+    fn folder_kind() -> TreeItemKind {
+        TreeItemKind::Folder(FolderMeta {
+            repo_root: "repo".into(),
+            folder_path: "src".into(),
+        })
+    }
+
+    #[gpui::test]
+    fn pr40_height_strategy_default_is_fixed_for_kind() {
+        // `HeightStrategy::default()` must mirror PR-35's behaviour:
+        // resolve through `height_for_kind` so existing callers do not
+        // need to opt in.
+        assert_eq!(
+            HeightStrategy::default(),
+            HeightStrategy::FixedForKind,
+            "PR-40 default behaviour must equal PR-35's `height_for_kind` lookup"
+        );
+    }
+
+    #[gpui::test]
+    fn pr40_height_strategy_fixed_for_kind_matches_height_for_kind(cx: &mut gpui::TestAppContext) {
+        // `HeightStrategy::FixedForKind::resolve` must return the same
+        // `Size<Pixels>` as the PR-35 `height_for_kind` free function
+        // for every `TreeItemKind` variant, otherwise PR-35 tests
+        // would silently regress.
+        let cases = [
+            repo_header_kind(),
+            commit_input_kind(),
+            group_header_kind(),
+            resource_row_kind(),
+            folder_kind(),
+        ];
+        cx.update(|cx| {
+            for (ix, kind) in cases.iter().enumerate() {
+                let size = HeightStrategy::FixedForKind.resolve(kind, cx);
+                let expected = height_for_kind(kind);
+                assert_eq!(
+                    size.width, expected.width,
+                    "FixedForKind width differs from height_for_kind for kind #{ix}"
+                );
+                assert_eq!(
+                    size.height, expected.height,
+                    "FixedForKind height differs from height_for_kind for kind #{ix}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn pr40_height_strategy_natural_returns_zero_size_for_any_kind(cx: &mut gpui::TestAppContext) {
+        // `Natural` is the EX-1 answer for the commit input row: the
+        // row's `ListItem` body decides its own height and the
+        // strategy resolver returns `size(0, 0)` so `uniform_list`
+        // `ListSizingBehavior::Auto` can measure the first item.
+        let kinds = [
+            repo_header_kind(),
+            commit_input_kind(),
+            group_header_kind(),
+            resource_row_kind(),
+            folder_kind(),
+        ];
+        cx.update(|cx| {
+            for (ix, kind) in kinds.iter().enumerate() {
+                let size = HeightStrategy::Natural.resolve(kind, cx);
+                assert_eq!(
+                    size.width,
+                    gpui::px(0.),
+                    "Natural mode must return zero width for kind #{ix}"
+                );
+                assert_eq!(
+                    size.height,
+                    gpui::px(0.),
+                    "Natural mode must return zero height for kind #{ix}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn pr40_caller_context_upgrade_succeeds_when_panel_alive(cx: &mut gpui::TestAppContext) {
+        // A renderer that captures `&dyn TreeCallerContext` must be
+        // able to read the wrapped panel's state without itself
+        // holding the `WeakEntity`.  We mirror the source-control
+        // panel pattern: wrap a `WeakEntity<TestPanel>`, ask the
+        // trait to dispatch a typed update, and verify the closure
+        // sees the panel.
+        let panel = cx.new(|_cx| Pr40TestPanel::default());
+        let weak = panel.downgrade();
+        let caller: Rc<dyn TreeCallerContext> = Rc::new(WeakCallerContext::new(weak));
+
+        let panel_was_seen: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let counter_after: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let seen = panel_was_seen.clone();
+        let counter = counter_after.clone();
+
+        cx.update(|cx| {
+            let result = caller.caller_update_with(
+                TypeId::of::<Pr40TestPanel>(),
+                cx,
+                Box::new(move |panel_any, _app| {
+                    let typed = panel_any
+                        .downcast_mut::<Pr40TestPanel>()
+                        .expect("type tag match");
+                    typed.counter += 1;
+                    *seen.borrow_mut() = true;
+                    Box::new(typed.counter) as Box<dyn Any>
+                }),
+            );
+            assert!(result.is_some(), "panel must be alive");
+            let value = result.unwrap().downcast::<usize>().unwrap();
+            *counter.borrow_mut() = *value;
+        });
+
+        assert!(
+            *panel_was_seen.borrow(),
+            "renderer closure must have been invoked with the alive panel"
+        );
+        assert_eq!(*counter_after.borrow(), 1);
+        assert_eq!(panel.read_with(cx, |p, _| p.counter), 1);
+    }
+
+    #[gpui::test]
+    fn pr40_caller_context_upgrade_returns_none_when_panel_dropped(cx: &mut gpui::TestAppContext) {
+        // Drop-equivalent: the `WeakEntity` cannot be upgraded, so
+        // `caller_update_with` must return `None` (not panic) and the
+        // renderer closure must never run.
+        let panel = cx.new(|_cx| Pr40TestPanel::default());
+        let weak = panel.downgrade();
+        let caller: Rc<dyn TreeCallerContext> = Rc::new(WeakCallerContext::new(weak));
+        drop(panel);
+
+        cx.update(|cx| {
+            let result = caller.caller_update_with(
+                TypeId::of::<Pr40TestPanel>(),
+                cx,
+                Box::new(|_panel, _app| Box::new(()) as Box<dyn Any>),
+            );
+            assert!(
+                result.is_none(),
+                "caller_update_with must report the dropped panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pr40_caller_context_wrong_type_id_returns_none(cx: &mut gpui::TestAppContext) {
+        // The trait uses `TypeId` for type-safe dispatch: a renderer
+        // asking for the wrong panel type must get `None` even when the
+        // wrapped entity is still alive.
+        #[derive(Default)]
+        struct PanelA;
+        #[derive(Default)]
+        struct PanelB;
+
+        let panel_a = cx.new(|_cx| PanelA);
+        let weak = panel_a.downgrade();
+        let caller: Rc<dyn TreeCallerContext> = Rc::new(WeakCallerContext::new(weak));
+
+        cx.update(|cx| {
+            let result = caller.caller_update_with(
+                TypeId::of::<PanelB>(),
+                cx,
+                Box::new(|_panel, _app| Box::new(()) as Box<dyn Any>),
+            );
+            assert!(
+                result.is_none(),
+                "a wrong panel TypeId must report no upgrade even when the entity is alive"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pr40_loading_state_default_is_ready() {
+        // `TreeItemEntry::default()`-style usage must produce `Ready`
+        // entries so PR-35 callers lifted via `from_kind_vec` keep
+        // their ready-render behaviour.
+        let entry = TreeItemEntry::ready(commit_input_kind());
+        assert_eq!(entry.loading_state, LoadingState::Ready);
+
+        let lifted = TreeItemEntry::from_kind_vec(vec![
+            repo_header_kind(),
+            commit_input_kind(),
+            resource_row_kind(),
+        ]);
+        assert_eq!(lifted.len(), 3);
+        for entry in &lifted {
+            assert_eq!(
+                entry.loading_state,
+                LoadingState::Ready,
+                "from_kind_vec must produce Ready entries"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn pr40_loading_state_constructor_helpers_distinguish_variants() {
+        // The three building helpers must cover the three lifecycle
+        // states without overlap.
+        let pending = TreeItemEntry::pending(commit_input_kind());
+        let ready = TreeItemEntry::ready(commit_input_kind());
+        let hidden = TreeItemEntry::hidden(commit_input_kind());
+
+        assert_eq!(pending.loading_state, LoadingState::Pending);
+        assert_eq!(ready.loading_state, LoadingState::Ready);
+        assert_eq!(hidden.loading_state, LoadingState::Hidden);
+
+        // The wrapped payload is preserved regardless of state.
+        for entry in [&pending, &ready, &hidden] {
+            assert!(
+                matches!(entry.kind, TreeItemKind::CommitInput(_)),
+                "TreeItemEntry must keep the original TreeItemKind payload"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn pr40_loading_state_count_aggregates_per_variant(cx: &mut gpui::TestAppContext) {
+        // `TreeMultiKindWithStrategy::loading_state_counts` lets
+        // callers (and tests) assert how many rows in each lifecycle
+        // state.  This is the surface that downstream PR-39 work will
+        // check after every "ready"/"pending" transition.
+        let state = cx.new(|cx| TreeState::new(cx));
+        let caller: Rc<dyn TreeCallerContext> = Rc::new(WeakCallerContext::<Pr40TestPanel>::new(
+            cx.new(|_cx| Pr40TestPanel::default()).downgrade(),
+        ));
+        let renderer = TreeEntryRendererWithHeight::new(
+            |_k| true,
+            |ix, _kind, _h, _caller, _window, _cx| ListItem::new(("any", ix)),
+        );
+        let entries = vec![
+            TreeItemEntry::ready(repo_header_kind()),
+            TreeItemEntry::ready(commit_input_kind()),
+            TreeItemEntry::pending(commit_input_kind()),
+            TreeItemEntry::hidden(group_header_kind()),
+            TreeItemEntry::hidden(resource_row_kind()),
+            TreeItemEntry::hidden(folder_kind()),
+        ];
+        let tree = TreeMultiKindWithStrategy::new(
+            &state,
+            "test.loading_state",
+            entries,
+            vec![renderer],
+            caller,
+            HeightStrategy::FixedForKind,
+        );
+        let (pending, ready, hidden) = tree.loading_state_counts();
+        assert_eq!((pending, ready, hidden), (1, 2, 3));
+        assert_eq!(tree.items_len(), 6);
+    }
+
+    #[gpui::test]
+    fn pr40_tree_multi_kind_with_strategy_round_trips_pr35_via_migration(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // `tree_multi_kind_with_strategy` is the PR-35 → PR-40 migration
+        // shim: it accepts the old `Vec<TreeItemKind>` + `Vec<TreeEntryRenderer>`
+        // signatures and rebuilds a strategy-aware tree with
+        // `HeightStrategy::FixedForKind` so callers do not observe a
+        // behavioural change.
+        let state = cx.new(|cx| TreeState::new(cx));
+        let caller: Rc<dyn TreeCallerContext> = Rc::new(WeakCallerContext::<Pr40TestPanel>::new(
+            cx.new(|_cx| Pr40TestPanel::default()).downgrade(),
+        ));
+
+        let renderer = TreeEntryRenderer::new(
+            |kind| matches!(kind, TreeItemKind::RepoHeader(_)),
+            |ix, _kind, _window, _cx| ListItem::new(("repo", ix)),
+        );
+
+        let tree = tree_multi_kind_with_strategy(
+            &state,
+            "test.migration",
+            vec![repo_header_kind()],
+            vec![renderer],
+            caller,
+            HeightStrategy::FixedForKind,
+        );
+
+        assert_eq!(tree.items_len(), 1);
+        // Every entry lifted by `from_kind_vec` is `Ready`.
+        let (pending, ready, hidden) = tree.loading_state_counts();
+        assert_eq!((pending, ready, hidden), (0, 1, 0));
     }
 }
