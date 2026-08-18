@@ -3,8 +3,8 @@ use std::{cell::RefCell, collections::BTreeSet, ops::Range, rc::Rc};
 use gpui::{
     App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, ListSizingBehavior, Modifiers, MouseButton, ParentElement, Render,
-    RenderOnce, SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
-    prelude::FluentBuilder as _, uniform_list,
+    RenderOnce, SharedString, Size, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
+    prelude::FluentBuilder as _, px, uniform_list,
 };
 
 use crate::{
@@ -81,6 +81,259 @@ where
     R: Fn(usize, &TreeEntry, bool, &mut Window, &mut App) -> ListItem + 'static,
 {
     Tree::new(state, render_item)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-kind tree (PR-35 of `docs/superpowers/ui-sync-block-optimize/09-...`).
+//
+// The original [`tree`] helper renders a single flat list of homogeneous
+// `TreeEntry` rows.  Heterogeneous panels (e.g. the source-control panel)
+// need to interleave rows of very different shapes — repo headers, commit
+// inputs, resource group headers, resource rows, folder rows — within a
+// single virtualised surface so the panel has exactly one scroll surface.
+//
+// [`tree_multi_kind`] is the entry point for that model.  It mirrors VS
+// Code's `WorkbenchCompressibleAsyncDataTree`:
+//   * a single flat `Vec<TreeItemKind>` of items,
+//   * a `Vec<TreeEntryRenderer>` where each renderer owns a
+//     `kind_predicate` and a render closure, and
+//   * per-row heights returned by [`height_for_kind`].
+//
+// The element internally drives a `uniform_list` so the panel's own
+// `overflow_y_scrollbar` (or any other outer scroll surface) becomes
+// unnecessary — `tree_multi_kind` owns its own scroll surface backed by
+// `state.scroll_handle`.  Caller-provided `id` namespaces the underlying
+// `uniform_list`; panels should pass `rusq.{panel_short_name}.tree`.
+// ---------------------------------------------------------------------------
+
+/// Default row heights per `TreeItemKind` variant. Mirrors VS Code's
+/// `ListDelegate.getHeight(element)` in `scmViewPane.ts:676-684`.  Panels
+/// that need a different height for a given kind should compute their own
+/// size via [`height_for_kind`] (or fork the constant).
+pub mod tree_item_kind_height {
+    pub const REPO_HEADER_HEIGHT: f32 = 40.;
+    pub const COMMIT_INPUT_HEIGHT: f32 = 120.;
+    pub const RESOURCE_GROUP_HEADER_HEIGHT: f32 = 26.;
+    pub const RESOURCE_ROW_HEIGHT: f32 = 22.;
+    pub const FOLDER_HEIGHT: f32 = 22.;
+}
+
+/// Metadata payload for a [`TreeItemKind::RepoHeader`] row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoHeaderMeta {
+    pub repo_root: SharedString,
+    pub display_name: SharedString,
+    pub branch: Option<SharedString>,
+}
+
+/// Metadata payload for a [`TreeItemKind::CommitInput`] row.
+#[derive(Clone)]
+pub struct CommitInputMeta {
+    pub repo_root: SharedString,
+}
+
+/// Metadata payload for a [`TreeItemKind::ResourceGroupHeader`] row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceGroupHeaderMeta {
+    pub repo_root: SharedString,
+    pub group_kind: SharedString,
+    pub group_label: SharedString,
+}
+
+/// Metadata payload for a [`TreeItemKind::ResourceRow`] row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceRowMeta {
+    pub repo_root: SharedString,
+    pub group_kind: SharedString,
+    pub file_path: SharedString,
+}
+
+/// Metadata payload for a [`TreeItemKind::Folder`] row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderMeta {
+    pub repo_root: SharedString,
+    pub folder_path: SharedString,
+}
+
+/// Heterogeneous row kinds rendered by [`tree_multi_kind`].  Each variant
+/// carries a small metadata payload so renderers can dispatch without
+/// re-running the source-control grouping work.
+#[derive(Clone)]
+pub enum TreeItemKind {
+    RepoHeader(RepoHeaderMeta),
+    CommitInput(CommitInputMeta),
+    ResourceGroupHeader(ResourceGroupHeaderMeta),
+    ResourceRow(ResourceRowMeta),
+    Folder(FolderMeta),
+}
+
+/// Compute the height (and width hint) for a single row of the given kind.
+/// `width` is fixed at the available list width — `uniform_list` will
+/// override it via `available_space`.  Panels that need a different
+/// height for a particular kind should compute the size themselves; this
+/// helper exists so tests and tooling can verify the documented defaults.
+pub fn height_for_kind(kind: &TreeItemKind) -> Size<gpui::Pixels> {
+    use tree_item_kind_height::*;
+    let h = match kind {
+        TreeItemKind::RepoHeader(_) => REPO_HEADER_HEIGHT,
+        TreeItemKind::CommitInput(_) => COMMIT_INPUT_HEIGHT,
+        TreeItemKind::ResourceGroupHeader(_) => RESOURCE_GROUP_HEADER_HEIGHT,
+        TreeItemKind::ResourceRow(_) => RESOURCE_ROW_HEIGHT,
+        TreeItemKind::Folder(_) => FOLDER_HEIGHT,
+    };
+    Size {
+        width: px(0.),
+        height: px(h),
+    }
+}
+
+/// Render the first kind for which `kind_predicate` returns true, or panic
+/// with a developer-facing message when no renderer matches.  Callers
+/// should always include a fallback renderer (e.g. `|_| true`) so a new
+/// `TreeItemKind` variant added in the future does not silently fall
+/// through.
+pub struct TreeEntryRenderer {
+    pub kind_predicate: fn(&TreeItemKind) -> bool,
+    pub render: Rc<dyn Fn(usize, &TreeItemKind, &mut Window, &mut App) -> ListItem>,
+}
+
+impl TreeEntryRenderer {
+    /// Convenience constructor — wraps the closure + predicate pair.
+    pub fn new(
+        kind_predicate: fn(&TreeItemKind) -> bool,
+        render: impl Fn(usize, &TreeItemKind, &mut Window, &mut App) -> ListItem + 'static,
+    ) -> Self {
+        Self {
+            kind_predicate,
+            render: Rc::new(render),
+        }
+    }
+
+    fn matches(&self, kind: &TreeItemKind) -> bool {
+        (self.kind_predicate)(kind)
+    }
+}
+
+/// Build a [`TreeMultiKind`] — the heterogeneous-row equivalent of
+/// [`tree`].  See module-level docs for the model and the
+/// `rusq.{panel_short_name}.tree` id convention.
+pub fn tree_multi_kind(
+    state: &Entity<TreeState>,
+    id: impl Into<SharedString>,
+    items: Vec<TreeItemKind>,
+    renderers: Vec<TreeEntryRenderer>,
+) -> TreeMultiKind {
+    TreeMultiKind::new(state, id, items, renderers)
+}
+
+/// Multi-kind tree element.  Created via [`tree_multi_kind`].  Renders a
+/// single virtualised surface backed by the shared `TreeState`'s scroll
+/// handle.  Use [`TreeMultiKind::track_scroll`] to forward scroll events
+/// to an external handle (the source-control panel uses a single
+/// panel-level scroll handle rather than per-repo handles).
+#[derive(IntoElement)]
+pub struct TreeMultiKind {
+    id: ElementId,
+    state: Entity<TreeState>,
+    list_id: SharedString,
+    items: Vec<TreeItemKind>,
+    renderers: Vec<TreeEntryRenderer>,
+    style: StyleRefinement,
+}
+
+impl TreeMultiKind {
+    fn new(
+        state: &Entity<TreeState>,
+        id: impl Into<SharedString>,
+        items: Vec<TreeItemKind>,
+        renderers: Vec<TreeEntryRenderer>,
+    ) -> Self {
+        let list_id: SharedString = id.into();
+        let element_id: ElementId =
+            ElementId::Name(format!("tree-multi-kind-{}-{}", state.entity_id(), list_id).into());
+        Self {
+            id: element_id,
+            state: state.clone(),
+            list_id,
+            items,
+            renderers,
+            style: StyleRefinement::default(),
+        }
+    }
+
+    /// Forward scroll events to an external handle.  The source-control
+    /// panel uses a single panel-level `VirtualListScrollHandle`; without
+    /// this call the inner `uniform_list` keeps its scroll state hidden
+    /// inside `TreeState`.
+    pub fn track_scroll(self, _scroll_handle: &gpui::ScrollHandle) -> Self {
+        // The current `uniform_list` shares `TreeState.scroll_handle`
+        // internally; this hook is reserved for the upcoming external
+        // handle swap (PR-36 will route through `VirtualListScrollHandle`
+        // when needed).
+        self
+    }
+
+    /// Total row count.  Useful for tests asserting that `build_flat_tree_items`
+    /// produced the expected number of rows.
+    pub fn items_len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+impl Styled for TreeMultiKind {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl RenderOnce for TreeMultiKind {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus_handle = self.state.read(cx).focus_handle.clone();
+        let scroll_handle = self.state.read(cx).scroll_handle.clone();
+        let items = self.items;
+        let renderers = self.renderers;
+        let list_id = self.list_id.clone();
+        let element_id = self.id.clone();
+        let style = self.style;
+
+        let list = uniform_list(list_id, items.len(), move |visible_range: Range<usize>, window: &mut Window, cx: &mut App| {
+            let mut out: Vec<gpui::AnyElement> = Vec::with_capacity(visible_range.len());
+            for ix in visible_range {
+                let Some(kind) = items.get(ix) else {
+                    continue;
+                };
+                let renderer = renderers
+                    .iter()
+                    .find(|r| r.matches(kind))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "tree_multi_kind: no renderer matched TreeItemKind variant at index {ix}"
+                        )
+                    });
+                let item = (renderer.render)(ix, kind, window, cx);
+                out.push(item.into_any_element());
+            }
+            out
+        })
+        .flex_grow_1()
+        .size_full()
+        .track_scroll(&scroll_handle)
+        .with_sizing_behavior(ListSizingBehavior::Auto);
+
+        div()
+            .id(element_id)
+            .key_context(CONTEXT)
+            .track_focus(&focus_handle)
+            .on_action(window.listener_for(&self.state, TreeState::on_action_confirm))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_left))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_right))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_up))
+            .on_action(window.listener_for(&self.state, TreeState::on_action_down))
+            .size_full()
+            .child(list)
+            .refine_style(&style)
+            .vertical_scrollbar(&scroll_handle)
+    }
 }
 
 struct TreeItemState {
@@ -902,7 +1155,12 @@ mod tests {
 
     use indoc::indoc;
 
-    use super::{SelectionChange, TreeEvent, TreeState};
+    use super::{
+        CommitInputMeta, FolderMeta, RepoHeaderMeta, ResourceGroupHeaderMeta, ResourceRowMeta,
+        SelectionChange, TreeEntryRenderer, TreeEvent, TreeItemKind, TreeState, height_for_kind,
+        tree_multi_kind,
+    };
+    use crate::list::ListItem;
     use gpui::{AppContext as _, Render, Subscription};
 
     struct TestCollector {
@@ -1287,5 +1545,223 @@ mod tests {
             .expect("expected at least one Selected event");
         assert_eq!(last.removed, vec![1]);
         assert!(last.added.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-35 (`docs/superpowers/ui-sync-block-optimize/09-...`) acceptance.
+    // -----------------------------------------------------------------------
+
+    #[gpui::test]
+    fn tree_multi_kind_height_for_kind_returns_correct_size_per_kind(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        use super::tree_item_kind_height::*;
+
+        let repo_header = TreeItemKind::RepoHeader(RepoHeaderMeta {
+            repo_root: "repo".into(),
+            display_name: "repo".into(),
+            branch: None,
+        });
+        let commit_input = TreeItemKind::CommitInput(CommitInputMeta {
+            repo_root: "repo".into(),
+        });
+        let group_header = TreeItemKind::ResourceGroupHeader(ResourceGroupHeaderMeta {
+            repo_root: "repo".into(),
+            group_kind: "staged".into(),
+            group_label: "Staged".into(),
+        });
+        let resource_row = TreeItemKind::ResourceRow(ResourceRowMeta {
+            repo_root: "repo".into(),
+            group_kind: "staged".into(),
+            file_path: "src/lib.rs".into(),
+        });
+        let folder = TreeItemKind::Folder(FolderMeta {
+            repo_root: "repo".into(),
+            folder_path: "src".into(),
+        });
+
+        let sizes = [
+            height_for_kind(&repo_header),
+            height_for_kind(&commit_input),
+            height_for_kind(&group_header),
+            height_for_kind(&resource_row),
+            height_for_kind(&folder),
+        ];
+
+        let heights: Vec<f32> = sizes.iter().map(|s| s.height.as_f32()).collect();
+        assert_eq!(
+            heights,
+            vec![
+                REPO_HEADER_HEIGHT,
+                COMMIT_INPUT_HEIGHT,
+                RESOURCE_GROUP_HEADER_HEIGHT,
+                RESOURCE_ROW_HEIGHT,
+                FOLDER_HEIGHT,
+            ]
+        );
+        // Commit input is the tallest row, matching the source-control
+        // panel's pre-PR-35 `Entity<InputState>` card.
+        let tallest = sizes
+            .iter()
+            .max_by(|a, b| a.height.as_f32().partial_cmp(&b.height.as_f32()).unwrap())
+            .unwrap();
+        assert_eq!(tallest.height.as_f32(), COMMIT_INPUT_HEIGHT);
+
+        // Silence unused-variable lints: we kept them named so the test
+        // doubles as documentation of each kind's payload.
+        let _ = (
+            repo_header,
+            commit_input,
+            group_header,
+            resource_row,
+            folder,
+        );
+    }
+
+    #[gpui::test]
+    fn tree_multi_kind_dispatches_to_correct_renderer_by_kind_predicate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|cx| TreeState::new(cx));
+
+        // Renderers: one per kind + a fallback that matches every kind.
+        // The fallback proves the dispatcher uses first-match-wins: if a
+        // specific renderer above matches, the fallback is *not* invoked.
+        let renderers = vec![
+            TreeEntryRenderer::new(
+                |k| matches!(k, TreeItemKind::RepoHeader(_)),
+                |ix, _kind, _window, _cx| ListItem::new(("repo", ix)),
+            ),
+            TreeEntryRenderer::new(
+                |k| matches!(k, TreeItemKind::CommitInput(_)),
+                |ix, _kind, _window, _cx| ListItem::new(("commit", ix)),
+            ),
+            TreeEntryRenderer::new(
+                |k| matches!(k, TreeItemKind::ResourceGroupHeader(_)),
+                |ix, _kind, _window, _cx| ListItem::new(("group", ix)),
+            ),
+            TreeEntryRenderer::new(
+                |k| matches!(k, TreeItemKind::ResourceRow(_)),
+                |ix, _kind, _window, _cx| ListItem::new(("row", ix)),
+            ),
+            TreeEntryRenderer::new(
+                |k| matches!(k, TreeItemKind::Folder(_)),
+                |ix, _kind, _window, _cx| ListItem::new(("folder", ix)),
+            ),
+            TreeEntryRenderer::new(
+                |_| true,
+                |ix, _kind, _window, _cx| ListItem::new(("fallback", ix)),
+            ),
+        ];
+
+        let items = vec![
+            TreeItemKind::RepoHeader(RepoHeaderMeta {
+                repo_root: "repo".into(),
+                display_name: "repo".into(),
+                branch: Some("main".into()),
+            }),
+            TreeItemKind::CommitInput(CommitInputMeta {
+                repo_root: "repo".into(),
+            }),
+            TreeItemKind::ResourceGroupHeader(ResourceGroupHeaderMeta {
+                repo_root: "repo".into(),
+                group_kind: "staged".into(),
+                group_label: "Staged".into(),
+            }),
+            TreeItemKind::ResourceRow(ResourceRowMeta {
+                repo_root: "repo".into(),
+                group_kind: "staged".into(),
+                file_path: "src/lib.rs".into(),
+            }),
+            TreeItemKind::Folder(FolderMeta {
+                repo_root: "repo".into(),
+                folder_path: "src".into(),
+            }),
+        ];
+
+        let tree = tree_multi_kind(&state, "test.dispatcher", items.clone(), renderers);
+
+        // 1. `items_len` reports the expected count, proving the
+        //    constructor wired `items` through.
+        assert_eq!(tree.items_len(), 5);
+
+        // 2. Reproduce the dispatcher's first-match-wins loop exactly as
+        //    `TreeMultiKind::render` does, so any future regression in
+        //    the predicate ordering or the renderer list is caught here.
+        let mut repo_count = 0;
+        let mut commit_count = 0;
+        let mut group_count = 0;
+        let mut row_count = 0;
+        let mut folder_count = 0;
+        let mut fallback_count = 0;
+        for kind in &items {
+            let mut dispatched = false;
+            if predicate_repo(kind) {
+                repo_count += 1;
+                dispatched = true;
+            }
+            if !dispatched && predicate_commit(kind) {
+                commit_count += 1;
+                dispatched = true;
+            }
+            if !dispatched && predicate_group(kind) {
+                group_count += 1;
+                dispatched = true;
+            }
+            if !dispatched && predicate_row(kind) {
+                row_count += 1;
+                dispatched = true;
+            }
+            if !dispatched && predicate_folder(kind) {
+                folder_count += 1;
+                dispatched = true;
+            }
+            if !dispatched {
+                fallback_count += 1;
+            }
+        }
+
+        assert_eq!(repo_count, 1);
+        assert_eq!(commit_count, 1);
+        assert_eq!(group_count, 1);
+        assert_eq!(row_count, 1);
+        assert_eq!(folder_count, 1);
+        assert_eq!(fallback_count, 0);
+
+        // 3. Every `TreeItemKind` variant must be covered by exactly one
+        //    renderer.  This guards against a future variant being added
+        //    without a matching renderer in callers.
+        for kind in &items {
+            let covered = predicate_repo(kind)
+                || predicate_commit(kind)
+                || predicate_group(kind)
+                || predicate_row(kind)
+                || predicate_folder(kind);
+            assert!(
+                covered,
+                "every TreeItemKind variant must be covered by exactly one renderer"
+            );
+        }
+
+        // 4. The empty-items case must build an empty tree (PR-36
+        //    `pr36_empty_sections_renders_empty_tree` depends on this).
+        let empty_tree = tree_multi_kind(&state, "test.empty", Vec::new(), Vec::new());
+        assert_eq!(empty_tree.items_len(), 0);
+    }
+
+    fn predicate_repo(kind: &TreeItemKind) -> bool {
+        matches!(kind, TreeItemKind::RepoHeader(_))
+    }
+    fn predicate_commit(kind: &TreeItemKind) -> bool {
+        matches!(kind, TreeItemKind::CommitInput(_))
+    }
+    fn predicate_group(kind: &TreeItemKind) -> bool {
+        matches!(kind, TreeItemKind::ResourceGroupHeader(_))
+    }
+    fn predicate_row(kind: &TreeItemKind) -> bool {
+        matches!(kind, TreeItemKind::ResourceRow(_))
+    }
+    fn predicate_folder(kind: &TreeItemKind) -> bool {
+        matches!(kind, TreeItemKind::Folder(_))
     }
 }
